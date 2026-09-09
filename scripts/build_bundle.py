@@ -13,6 +13,7 @@ NAME = "codex-native-imagegen-register"
 ACTIONS = ("install", "check", "status", "restore")
 # Never collect arbitrary working-tree files: local credentials/logs stay out.
 RELEASE_FILES = (
+    "LICENSE",
     "README.md",
     "CONTRIBUTING.md",
     "docs/usage.zh-CN.md",

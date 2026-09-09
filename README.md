@@ -113,4 +113,4 @@ python scripts/build_bundle.py
 
 ---
 
-进一步了解：[使用原理与诊断说明](docs/usage.zh-CN.md) · [开发与发布](CONTRIBUTING.md)
+进一步了解：[使用原理与诊断说明](docs/usage.zh-CN.md) · [开发与发布](CONTRIBUTING.md) · [MIT License](LICENSE)
