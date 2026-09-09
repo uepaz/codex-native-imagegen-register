@@ -319,39 +319,18 @@ def dump_toml(document: dict[str, Any]) -> bytes:
     return text.encode('utf-8')
 
 
-def is_our_legacy_auth(raw: bytes | None) -> bool:
-    try:
-        a = parse_auth(raw)
-        if a.get('auth_mode') != 'chatgptAuthTokens':
-            return False
-        part = a['tokens']['id_token'].split('.')[1]
-        claims = json.loads(base64.urlsafe_b64decode(part + '=' * (-len(part) % 4)))
-        return (claims.get('local_relay_placeholder') is True
-                and claims.get('iss') == 'https://local-relay.invalid/'
-                and claims.get('aud') == 'codex-local-compatibility-only')
-    except (SetupError, ValueError, KeyError, IndexError, TypeError, AttributeError):
-        return False
-
-
 def plan(home: Path) -> dict[str, Any]:
     before = {f: read_optional(home / f) for f in ('config.toml', 'auth.json')}
     if before['config.toml'] is None:
         raise SetupError('没有找到当前 CODEX_HOME/config.toml；不会猜选供应商或提示输入。')
     config = parse_config(before['config.toml'])
+    original_config = copy.deepcopy(config)
     check_conflicts(config)
     ensure_local_scope(home, config)
-    auth = parse_auth(before['auth.json'])
-    legacy = is_our_legacy_auth(before['auth.json'])
-    # Never overwrite a real/unknown account just to pass the image feature predicate.
-    if auth.get('tokens') is not None and not legacy:
-        raise SetupError('检测到非本工具生成的账号令牌；本版不会覆盖真实/未知登录状态。')
-    if auth.get('auth_mode') not in (None, 'apikey', 'api_key') and not legacy:
-        raise SetupError('检测到未知认证模式；未修改认证或配置。')
+    # Provider credentials take precedence here. Leave unrelated login state
+    # untouched; only parse auth.json if it is needed as the API key source.
     profile = selected_profile(config)
     effective = config['profiles'][profile] if profile else config
-    store = effective.get('cli_auth_credentials_store',config.get('cli_auth_credentials_store','file'))
-    if store not in ('file',None):
-        raise SetupError('当前认证使用系统密钥库或内存存储；无法排除另一账号覆盖工具注册条件，本版不修改。')
     if any(effective.get(k) is not None for k in ('forced_login_method','forced_chatgpt_workspace_id','allowed_login_methods')):
         raise SetupError('当前 profile 有登录策略限制；本工具不修改受管限制。')
     pid = effective.get('model_provider', config.get('model_provider'))
@@ -378,9 +357,11 @@ def plan(home: Path) -> dict[str, Any]:
             raise SetupError('供应商 HTTP headers 不是 TOML 表。')
         if any(k.lower() == 'authorization' for k in hs):
             raise SetupError('已有自定义 Authorization 请求头；凭据优先级有歧义，未修改。')
-        for k, v in hs.items():
-            if k.lower() == ACTOR_HEADER and (htype != 'http_headers' or v != ACTOR_MARKER):
-                raise SetupError('已有 actor 授权请求头；不会覆盖它。')
+        # This one header is part of the requested compatibility patch. Remove
+        # case variants and environment overrides so it is sent exactly once.
+        for k in list(hs):
+            if k.lower() == ACTOR_HEADER:
+                del hs[k]
     notes = []
     key_source = None
     if 'env_key' in provider:
@@ -398,10 +379,9 @@ def plan(home: Path) -> dict[str, Any]:
         store = effective.get('cli_auth_credentials_store',config.get('cli_auth_credentials_store','file'))
         if store not in ('file',None):
             raise SetupError('凭据可能位于系统密钥库；本版不会猜用旧 auth.json。')
-        key = auth_file_key(before['auth.json'])
-        provider['experimental_bearer_token'] = key
-        key_source = 'auth_file_copied_to_provider'
-        notes.append('原 API Key 复制到当前供应商 bearer；config.toml 和备份可能包含明文 Key。')
+        auth_file_key(before['auth.json'])
+        key_source = 'auth_file'
+        notes.append('保留 auth.json 中现有的 API Key；不迁移或复制到供应商配置。')
     provider['requires_openai_auth'] = False
     provider.setdefault('http_headers', {})[ACTOR_HEADER] = ACTOR_MARKER
     # Configuration uses [features.code_mode], not a top-level [code_mode].
@@ -421,6 +401,9 @@ def plan(home: Path) -> dict[str, Any]:
         direct = cm.setdefault('direct_only_tool_namespaces', [])
         if not isinstance(direct,list) or any(not isinstance(v,str) for v in direct):
             raise SetupError('direct_only_tool_namespaces 不是字符串数组。')
+        # Preserve other namespaces and their order; deduplicate image_gen only.
+        direct[:] = [v for i, v in enumerate(direct)
+                     if v != 'image_gen' or 'image_gen' not in direct[:i]]
         if 'image_gen' not in direct:
             direct.append('image_gen')
         features['code_mode'] = cm
@@ -441,11 +424,13 @@ def plan(home: Path) -> dict[str, Any]:
             raise SetupError('现有模型目录不是有效 JSON。') from None
         if not isinstance(obj,dict) or not isinstance(obj.get('models'),list):
             raise SetupError('现有模型目录结构不受支持。')
-    after = {'config.toml': dump_toml(config), 'auth.json': None if legacy else before['auth.json']}
+    config_bytes = (before['config.toml'] if equivalent(config, original_config)
+                    else dump_toml(config))
+    after = {'config.toml': config_bytes, 'auth.json': before['auth.json']}
     return {'before':before, 'after':after, 'config':config, 'provider_id':pid,
             'model':model, 'catalog':catalog, 'summary':{
                 'provider_model_and_address_preserved':True,
-                'credential_source':key_source,'removed_our_legacy_external_auth':legacy,
+                'credential_source':key_source,'auth_file_preserved':True,
                 'added_noncredential_actor_header':True,
                 'native_tool':'image_gen.imagegen','notes':notes}}
 
@@ -1130,9 +1115,12 @@ def restore(home: Path, force: bool = False) -> dict[str, Any]:
         run, meta = state
         if meta["phase"] == "restored":
             return {"state": "ALREADY_RESTORED", "backup": str(run)}
+        # Old manifests are also supported: their hashes identify exactly which
+        # files that installation changed. Never restore an untouched auth.json.
+        affected = [name for name in FILES if meta['before'][name] != meta['after'][name]]
         original: dict[str, bytes | None] = {}
-        current = {name: read_optional(home / name) for name in FILES}
-        for name in FILES:
+        current = {name: read_optional(home / name) for name in affected}
+        for name in affected:
             data = read_optional(run / (name + ".before"))
             if digest(data) != meta["before"][name]:
                 raise SetupError("原始备份校验失败；拒绝恢复，未改动配置。")
@@ -1144,14 +1132,14 @@ def restore(home: Path, force: bool = False) -> dict[str, Any]:
         for name, data in current.items():
             if data is not None:
                 atomic_write(emergency / name, data, emergency)
-        for name in FILES:
+        for name in affected:
             if digest(read_optional(home / name)) != digest(current[name]):
                 raise SetupError("恢复期间配置被其他进程修改，已停止；请关闭 Codex 后检查 Status。")
             if original[name] is None:
                 (home / name).unlink(missing_ok=True)
             else:
                 atomic_write(home / name, original[name], run)
-        if any(digest(read_optional(home / name)) != meta["before"][name] for name in FILES):
+        if any(digest(read_optional(home / name)) != meta["before"][name] for name in affected):
             raise SetupError("恢复后校验失败；请保留备份目录。")
         meta["phase"] = "restored"
         write_json(run / "manifest.json", meta, run)
@@ -1176,6 +1164,7 @@ def commit(home: Path, proposal: dict[str, Any], probe: dict[str, Any], root: Pa
     before,after=proposal['before'],proposal['after']
     if any(read_optional(home/f)!=before[f] for f in FILES):
         raise SetupError('配置在自检期间被其他进程修改；未提交修改。')
+    prior_pointer = read_optional(root/'active.json')
     run=root/uuid.uuid4().hex; secure_dir(run)
     for name,data in before.items():
         if data is not None:
@@ -1210,8 +1199,13 @@ def commit(home: Path, proposal: dict[str, Any], probe: dict[str, Any], root: Pa
                     (home/name).unlink(missing_ok=True)
                 else:
                     atomic_write(home/name,before[name],run)
-        if all(read_optional(home/f)==before[f] for f in FILES):
+        if all(read_optional(home/f)==before[f] for f in changed):
             meta['phase']='restored'; write_json(run/'manifest.json',meta,run)
+            # A failed reinstallation must not hide the previous recovery point.
+            if prior_pointer is None:
+                (root/'active.json').unlink(missing_ok=True)
+            else:
+                atomic_write(root/'active.json',prior_pointer,root)
         if isinstance(exc,(SetupError,KeyboardInterrupt)):
             raise
         raise SetupError('写入失败，已尝试回滚。请保留备份并执行 Status。') from None
@@ -1219,14 +1213,11 @@ def commit(home: Path, proposal: dict[str, Any], probe: dict[str, Any], root: Pa
 
 
 def install(home: Path,binary: Path, version_result: dict[str,Any] | None=None) -> dict[str,Any]:
-    proposal=plan(home)
     with locked(home) as root:
         prior=active_state(root)
         if prior and prior[1]['phase'] not in ('restored','installed'):
             raise SetupError('存在未完成的本版安装记录；请先 Restore。')
-        if prior and prior[1]['phase']=='installed':
-            if not status(home)['files_match_installed_snapshot']:
-                raise SetupError('本版安装后配置发生改动；不会覆盖，请先核对或 Restore。')
+        proposal=plan(home)
         print('正在用 App 自带后端检查原生 image_gen：仅本机模拟接口，不调用中转模型。',flush=True)
         result=native_probe(binary,proposal,version_result)
         if not result['passed']:
@@ -1235,15 +1226,19 @@ def install(home: Path,binary: Path, version_result: dict[str,Any] | None=None) 
                     'message':'该后端未通过这条兼容路径的本机自检；没有写入新配置。已有旧版改动也未自动撤销。'}
         # Probe subprocesses have exited; recheck that no actual application has reopened.
         ensure_app_closed()
-        if prior and prior[1]['phase']=='installed':
-            if any(read_optional(home/f)!=proposal['before'][f] for f in FILES):
-                raise SetupError('配置在自检期间发生改动；未更新安装记录。')
+        if any(read_optional(home/f)!=proposal['before'][f] for f in FILES):
+            raise SetupError('配置在自检期间发生改动；未提交修改，请重新执行。')
+        modified = any(proposal['before'][f] != proposal['after'][f] for f in FILES)
+        if not modified and prior and prior[1]['phase']=='installed':
             run,meta=prior; meta['native_probe']=result
             write_json(run/'manifest.json',meta,run)
-            out=status(home); out['state']='ALREADY_INSTALLED_NATIVE_PROBE_PASSED'
+            out=status(home); out.update(state='ALREADY_INSTALLED_NATIVE_PROBE_PASSED',files_modified=False)
             return out
+        # Each modifying install gets its own snapshot. A no-op keeps the last
+        # recovery point, even after unrelated user edits or a login refresh.
         out=commit(home,proposal,result,root)
         out['state']='INSTALLED_NATIVE_PROBE_PASSED'
+        out['files_modified']=modified
         return out
 
 
@@ -1288,7 +1283,7 @@ def main(argv: list[str] | None=None) -> int:
             result['backend_start']=launch
         print(json.dumps(result,ensure_ascii=False,indent=2))
         if result['state'].startswith(('INSTALLED_','ALREADY_INSTALLED_')):
-            print('\n已写入配置，且应用后端在本机模拟接口上完成原生工具调用。')
+            print('\n配置已就绪，且应用后端在本机模拟接口上完成原生工具调用。')
             print('这不是实际中转生图成功，也不是 OAuth 登录成功；请重开 App 新建对话实测。')
             print('中转必须忽略/去除兼容用 actor 请求头，并兼容原生 Images API。')
         return 2 if result['state'] in ('NOT_APPLIED_NATIVE_PROBE_FAILED','CHECK_NATIVE_PROBE_FAILED') else 0
