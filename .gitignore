@@ -1,0 +1,31 @@
+# Generated release bundles and local test output
+/dist/
+/build/
+/test-results/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.venv/
+venv/
+
+# Local configuration, credentials, backups and logs
+.env
+.env.*
+!.env.example
+auth.json
+config.toml
+.codex/
+.native-imagegen-registration*/
+*.log
+*.bak
+*.backup
+
+# Editor / operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
