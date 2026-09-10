@@ -17,7 +17,7 @@
 ## 使用
 
 需要 Windows 本机已有 Python 3.11 或以上版本；无需额外依赖包。
-完全退出 ChatGPT/Codex（包括托盘实例）、CodexPlusPlus 和终端中的 Codex。
+完全退出 ChatGPT/Codex（包括托盘实例）、CodexPlusPlus、CC Switch 和终端中的 Codex。
 解压到新目录，双击 `install.cmd`，或者运行单文件：
 
 ```powershell
@@ -46,12 +46,14 @@ SHA-256 相同时，才使用对应缓存后端。
 - `features.code_mode.direct_only_tool_namespaces` 包含且仅包含一个 `image_gen`，保留其他 namespace 及其顺序。
 
 供应商、模型、`base_url`、现有 Key、审批与沙箱设置及其他配置值保持不变。
-保留原有凭据来源：`env_key`、显式 bearer 或 API Key 模式的 `auth.json`。
-Key 不迁移、不复制到其他配置位置；实际中转鉴权仍使用现有凭据配置。
+已有 `env_key` 或显式 bearer 时保留原有凭据配置。若 Key 仅存在于 API Key 模式的
+`auth.json`，会把同一个 Key 补到当前供应商的 `experimental_bearer_token`，
+确保 `requires_openai_auth=false` 后仍有可用的认证入口；不会更换 Key 的值。
 安装不删除、不重写 `auth.json`，也不清理其中的旧登录占位数据。
 
 自检通过后，需要写入时会新建备份，保存本次执行前的原始文件；之前的备份目录继续保留。
 无需修改时不重写配置文件，也不替换已有恢复点。首次执行即无需修改时，会记录当前状态供查询与恢复。
+本工具此前生成的带引号表头会进行一次兼容性重写并备份，之后再次运行保持字节不变。
 `files_modified` 表示本次是否实际改动配置；Status 中的快照匹配结果仅供诊断，不再作为安装前提。
 
 恢复操作撤销最近一次实际写入，保留那次安装前已有的模型、Key 和其他设置。
@@ -63,7 +65,22 @@ Key 不迁移、不复制到其他配置位置；实际中转鉴权仍使用现�
 安装自检期间或写入期间发生新的文件修改时，仍会停止以避免覆盖并发编辑。
 未完成的安装事务、损坏的备份记录或受管限制也需要先处理；这与旧快照不一致是不同情况。
 
+## CC Switch 兼容与已有重复表
+
+普通字段与表头使用 `model_provider`、`base_url` 和 `[model_providers.custom]`
+等常规写法，只有 TOML 语法要求时才给键名加引号。这样 CC Switch 按文本编辑供应商时，
+能定位原表和字段，不会因本工具的过度引号格式漏判并追加同名表。
+
+若文件已经包含重复表，脚本会明确报错且不写入。请在故障电脑上先备份文件，
+将重复供应商段的字段合并到同一个表中，并核对冲突值；不要仅删除表头，否则字段可能归入错误的表。
+TOML 解析恢复正常后，再执行安装。此修复不自动操作 CC Switch 的数据库或供应商列表。
+
 ## 自检与验证边界
+
+生成安装计划、启动自检和提交配置前，都会检查实际待写入配置中的凭据入口。
+自检沿用该配置的 `env_key` 或显式 bearer 认证方式，仅将密钥替换为本机模拟 Key；
+不会为缺失凭据的配置无条件添加 bearer 再判断成功。诊断字段
+`provider_authentication_route` 记录所验证的方式，不包含真实 Key 或环境变量名称。
 
 同时识别：
 
@@ -126,7 +143,8 @@ features.image_generation=true，features.code_mode.direct_only_tool_namespaces 
 它可能出现在普通聊天及图片请求中；中转需要忽略/去除，否则中转或上游可能拒绝请求。
 这不是官方支持承诺，不能保证任意 App/中转兼容。
 
-保留环境变量、显式 bearer 或 API Key 模式 auth.json 中的现有 Key，不迁移其存储位置。
+保留现有环境变量或显式 bearer；Key 仅位于 API Key 模式的 auth.json 时，
+将原值补到当前 provider，原 auth.json 仍保持不变。
 配置和备份可能含明文 Key，不要分享。
 已有供应商凭据时，不依赖、不改写其他登录状态。需要从认证文件读取 Key 时，
 受管登录限制、密钥库状态或凭据来源歧义仍会停止，而不是猜选或绕过。

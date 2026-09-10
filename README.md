@@ -31,11 +31,15 @@
 **准备环境：** Windows、Python 3.11+，以及本机已安装的 Codex / ChatGPT 桌面端。使用普通用户身份运行即可。
 
 1. **解压文件** — 将 `codex-native-imagegen-register.zip` 解压到独立目录。
-2. **退出应用** — 完全退出 ChatGPT/Codex（包括托盘实例）、CodexPlusPlus 和终端中的 Codex。
+2. **退出应用** — 完全退出 ChatGPT/Codex（包括托盘实例）、CodexPlusPlus、CC Switch 和终端中的 Codex。
 3. **检查并安装** — 双击 `install.cmd`，脚本会先运行本机自检，通过后才写入配置。只想检查时，使用 `check.cmd`。
 4. **重新打开应用** — 新建会话，验证原生工具调用与实际图片结果。
 
 修改模型、供应商配置或登录状态后，可以再次运行 `install.cmd`。脚本以当前文件为准补齐生图配置，不因文件与旧快照不同而拒绝安装。重复运行不会重复添加 `image_gen`；无需改动时不重写配置文件。安装保留 `auth.json` 的原始内容。
+
+已有 `env_key` 或显式 bearer 时继续使用原配置；Key 仅在 `auth.json` 时，会将同一个 Key 补到当前 provider，避免 `requires_openai_auth=false` 后请求丢失认证。配置和备份可能含明文 Key，请勿公开分享。
+
+脚本输出兼容 CC Switch 的常规表头，并会修正本工具此前生成的带引号表头。若文件已出现重复的 `[model_providers.custom]`，须先合并并核对重复段中的字段，再运行脚本；不会自动猜选冲突值。
 
 > [!NOTE]
 > 首次下载或运行时，如果安全软件出现报毒、隔离或拦截提示，请先查看下方的 [报毒与误报说明](#报毒与误报说明)。

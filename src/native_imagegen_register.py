@@ -34,6 +34,11 @@ class SetupError(Exception):
 def toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
+def toml_key(value: str) -> str:
+    # CC Switch's line-based editor expects bare keys such as model_provider
+    # and [model_providers.custom]. Quote only keys that TOML requires quoted.
+    return value if re.fullmatch(r'[A-Za-z0-9_-]+', value) else toml_string(value)
+
 def toml_value(value: Any) -> str:
     if isinstance(value, str):
         return toml_string(value)
@@ -50,7 +55,7 @@ def toml_value(value: Any) -> str:
     if isinstance(value, list):
         return "[" + ", ".join(toml_value(x) for x in value) + "]"
     if isinstance(value, dict):
-        return "{ " + ", ".join(toml_string(k) + " = " + toml_value(v)
+        return "{ " + ", ".join(toml_key(k) + " = " + toml_value(v)
                                   for k, v in value.items()) + " }"
     raise SetupError("配置包含本工具无法无损保留的数据类型；未写入配置。")
 
@@ -72,7 +77,11 @@ def parse_config(data: bytes | None) -> dict[str, Any]:
         raise SetupError("config.toml 超过 8 MiB，请先检查配置；未写入。")
     try:
         return tomllib.loads(data.decode("utf-8-sig"))
-    except (UnicodeError, tomllib.TOMLDecodeError):
+    except tomllib.TOMLDecodeError as exc:
+        if 'Cannot declare' in str(exc) or 'Cannot overwrite' in str(exc):
+            raise SetupError('config.toml 存在重复表或重复字段；请先在 CC Switch/编辑器中合并重复供应商配置并核对字段。不会猜选覆盖值，未写入配置。') from None
+        raise SetupError('原 config.toml 不是有效的 UTF-8 TOML；未写入配置。') from None
+    except UnicodeError:
         raise SetupError("原 config.toml 不是有效的 UTF-8 TOML；未写入配置。") from None
 
 def assert_regular(path: Path) -> None:
@@ -304,10 +313,10 @@ def dump_toml(document: dict[str, Any]) -> bytes:
              '# May contain API credentials. Do not share this file.', '']
     def emit(table: dict, path: tuple[str, ...]) -> None:
         if path:
-            lines.append('[' + '.'.join(toml_string(k) for k in path) + ']')
+            lines.append('[' + '.'.join(toml_key(k) for k in path) + ']')
         for k, v in table.items():
             if not isinstance(v, dict):
-                lines.append(toml_string(k) + ' = ' + toml_value(v))
+                lines.append(toml_key(k) + ' = ' + toml_value(v))
         lines.append('')
         for k, v in table.items():
             if isinstance(v, dict):
@@ -379,9 +388,9 @@ def plan(home: Path) -> dict[str, Any]:
         store = effective.get('cli_auth_credentials_store',config.get('cli_auth_credentials_store','file'))
         if store not in ('file',None):
             raise SetupError('凭据可能位于系统密钥库；本版不会猜用旧 auth.json。')
-        auth_file_key(before['auth.json'])
-        key_source = 'auth_file'
-        notes.append('保留 auth.json 中现有的 API Key；不迁移或复制到供应商配置。')
+        provider['experimental_bearer_token'] = auth_file_key(before['auth.json'])
+        key_source = 'auth_file_copied_to_provider'
+        notes.append('auth.json 保持原样；将同一个 API Key 补到当前供应商 bearer，避免关闭 OpenAI 认证后丢失凭据入口。config.toml 和备份可能含明文 Key。')
     provider['requires_openai_auth'] = False
     provider.setdefault('http_headers', {})[ACTOR_HEADER] = ACTOR_MARKER
     # Configuration uses [features.code_mode], not a top-level [code_mode].
@@ -424,15 +433,51 @@ def plan(home: Path) -> dict[str, Any]:
             raise SetupError('现有模型目录不是有效 JSON。') from None
         if not isinstance(obj,dict) or not isinstance(obj.get('models'),list):
             raise SetupError('现有模型目录结构不受支持。')
-    config_bytes = (before['config.toml'] if equivalent(config, original_config)
+    # Repair the valid but over-quoted format written by this tool previously,
+    # even if the desired values already exist. Ordinary no-ops stay byte-stable.
+    original_text = before['config.toml'].decode('utf-8-sig')
+    legacy_quoted_format = (
+        '# Native image_gen registration compatibility (experimental).' in original_text.splitlines()
+        and re.search(r'^\["model_providers"(?:\]|\.)', original_text, re.MULTILINE) is not None
+    )
+    config_bytes = (before['config.toml'] if equivalent(config, original_config) and not legacy_quoted_format
                     else dump_toml(config))
     after = {'config.toml': config_bytes, 'auth.json': before['auth.json']}
-    return {'before':before, 'after':after, 'config':config, 'provider_id':pid,
+    proposal = {'before':before, 'after':after, 'config':config, 'provider_id':pid,
             'model':model, 'catalog':catalog, 'summary':{
                 'provider_model_and_address_preserved':True,
                 'credential_source':key_source,'auth_file_preserved':True,
                 'added_noncredential_actor_header':True,
                 'native_tool':'image_gen.imagegen','notes':notes}}
+    probe_authentication(proposal)
+    return proposal
+
+
+def probe_authentication(proposal: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+    """Validate the actual proposed bytes; mirror their credential route with a fake key.
+
+    Return only synthetic credentials for the loopback probe. Neither the real
+    API key nor its environment variable name is passed to the child process.
+    """
+    config = parse_config(proposal['after']['config.toml'])
+    profile = selected_profile(config)
+    effective = config['profiles'][profile] if profile else config
+    pid = effective.get('model_provider', config.get('model_provider'))
+    provider = config.get('model_providers', {}).get(pid, {})
+    if provider.get('requires_openai_auth') is not False:
+        raise SetupError('待写入供应商未设置 requires_openai_auth=false；未提交配置。')
+    if 'env_key' in provider:
+        name = provider['env_key']
+        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+            raise SetupError('待写入供应商的 env_key 无效；未提交配置。')
+        key, _scope = local_environment(name)
+        validate_secret(key)
+        probe_env_name = 'NATIVE_IMAGEGEN_PROBE_API_KEY'
+        return {'env_key': probe_env_name}, {probe_env_name: PROBE_KEY}
+    if 'experimental_bearer_token' in provider:
+        validate_secret(provider['experimental_bearer_token'])
+        return {'experimental_bearer_token': PROBE_KEY}, {}
+    raise SetupError('待写入供应商关闭了 OpenAI 认证，但没有可用的 env_key 或显式 bearer；仅保留 auth.json 不足以继续鉴权，未提交配置。')
 
 
 def png_fixture() -> bytes:
@@ -960,6 +1005,7 @@ def select_backend(inventory: dict[str,Any], timeout: float = VERSION_TIMEOUT) -
 
 def native_probe(binary: Path, proposal: dict[str, Any],
                  version_result: dict[str,Any] | None = None) -> dict[str, Any]:
+    probe_credentials, probe_env = probe_authentication(proposal)
     if not binary.is_file():
         raise SetupError('没有找到应用自带的后端程序。')
     command=[str(binary)]
@@ -989,7 +1035,7 @@ def native_probe(binary: Path, proposal: dict[str, Any],
             'model_providers':{'local_native_probe':{
                 'name':'Local native protocol probe','base_url':proxy+server.prefix,
                 'wire_api':'responses','requires_openai_auth':False,
-                'supports_websockets':False,'experimental_bearer_token':PROBE_KEY,
+                'supports_websockets':False,**probe_credentials,
                 'request_max_retries':0,'stream_max_retries':0,
                 'http_headers':{ACTOR_HEADER:ACTOR_MARKER}}}}
         if proposal.get('catalog') is not None:
@@ -1008,6 +1054,7 @@ def native_probe(binary: Path, proposal: dict[str, Any],
                     'NO_PROXY':'127.0.0.1,localhost','no_proxy':'127.0.0.1,localhost',
                     'OPENAI_BASE_URL':proxy+server.prefix,'RUST_LOG':'off',
                     'DO_NOT_TRACK':'1','NO_COLOR':'1'})
+        env.update(probe_env)
         exit_code = None
         stdout_present = False
         stderr_present = False
@@ -1037,6 +1084,7 @@ def native_probe(binary: Path, proposal: dict[str, Any],
                             if stream: stream.close()
                         stderr_present = errors.tell() > 0
             diagnostics = {
+                'provider_authentication_route': 'env_key' if probe_env else 'explicit_bearer',
                 'stage': probe_stage(server.flags, server.response_count, exit_code, server.problem),
                 'responses_request_count': server.response_count,
                 'native_schema_locations': sorted(server.schema_locations),
@@ -1161,6 +1209,7 @@ def status(home: Path) -> dict[str, Any]:
 def commit(home: Path, proposal: dict[str, Any], probe: dict[str, Any], root: Path) -> dict[str, Any]:
     if probe.get('passed') is not True:
         raise SetupError('原生工具自检未通过，禁止写入配置。')
+    probe_authentication(proposal)
     before,after=proposal['before'],proposal['after']
     if any(read_optional(home/f)!=before[f] for f in FILES):
         raise SetupError('配置在自检期间被其他进程修改；未提交修改。')
