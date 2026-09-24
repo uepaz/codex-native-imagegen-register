@@ -328,6 +328,155 @@ def dump_toml(document: dict[str, Any]) -> bytes:
     return text.encode('utf-8')
 
 
+def normalize_toml_key_syntax(raw: bytes, provider_id: str | None = None) -> bytes:
+    """规范化真实的 TOML 键与表头，不在配置值中搜索替换。
+
+    tomllib 负责校验语法及解析点号和引号；下方扫描只定位语句，
+    跳过字符串、数组和内联表，不解释配置值或合并重复定义。
+    """
+    original = parse_config(raw)
+    text = raw.decode('utf-8-sig')
+    newline = '\r\n' if '\r\n' in text else '\n'
+    edits: list[tuple[int, int, str]] = []
+    sections: set[tuple[str, ...]] = set()
+    section: tuple[str, ...] = ()
+    expand_layout = False
+
+    def key_path(key: str) -> tuple[str, ...]:
+        value = tomllib.loads(key + ' = 0')
+        parts = []
+        while isinstance(value, dict) and len(value) == 1:
+            name, value = next(iter(value.items()))
+            parts.append(name)
+        if value != 0 or not parts:
+            raise SetupError('无法安全识别 TOML 键名；未修改配置。')
+        return tuple(parts)
+
+    def delimiter(start: int, wanted: str) -> int:
+        quote = None
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if quote == '"' and ch == '\\':
+                    i += 2
+                    continue
+                if ch == quote:
+                    quote = None
+            elif ch in ('"', "'"):
+                quote = ch
+            elif ch == wanted:
+                return i
+            elif ch in '\r\n':
+                break
+            i += 1
+        raise SetupError('无法安全定位 TOML 字段边界；未修改配置。')
+
+    def value_end(start: int) -> int:
+        i, depth, quote = start, 0, None
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if quote[0] == '"' and ch == '\\':
+                    i += 2
+                    continue
+                if text.startswith(quote, i):
+                    i += len(quote)
+                    if len(quote) == 3:
+                        # 三引号结束符前允许一两个属于内容的引号，总共四或五个引号。
+                        for _ in range(2):
+                            if i < len(text) and text[i] == quote[0]:
+                                i += 1
+                    quote = None
+                    continue
+            elif ch in ('"', "'"):
+                quote = ch * 3 if text.startswith(ch * 3, i) else ch
+                i += len(quote)
+                continue
+            elif ch == '#':
+                end = text.find('\n', i)
+                if end == -1:
+                    return len(text)
+                i = end
+                continue
+            elif ch in '[{':
+                depth += 1
+            elif ch in ']}':
+                depth -= 1
+            elif ch == '\n' and depth == 0:
+                return i + 1
+            i += 1
+        return len(text)
+
+    i = 0
+    while i < len(text):
+        while i < len(text) and text[i] in ' \t\r\n':
+            i += 1
+        if i == len(text):
+            break
+        if text[i] == '#':
+            end = text.find('\n', i)
+            i = len(text) if end == -1 else end + 1
+            continue
+        if text[i] == '[':
+            width = 2 if text.startswith('[[', i) else 1
+            end = delimiter(i + width, ']')
+            path = key_path(text[i + width:end])
+            section = path
+            if width == 1:
+                sections.add(path)
+            elif provider_id is not None:
+                # CC Switch 不把数组表识别为分段边界；展开后可避免后续数组字段
+                # 被误归入正在编辑的供应商。
+                expand_layout = True
+            header = '[' * width + '.'.join(toml_key(k) for k in path) + ']' * width
+            end += width
+            line_end = text.find('\n', end)
+            if line_end == -1:
+                line_end = len(text)
+            suffix_end = line_end - 1 if text[line_end-1:line_end] == '\r' else line_end
+            suffix = text[end:suffix_end]
+            if suffix.lstrip().startswith('#'):
+                # CC Switch 不识别带行尾注释的表头，保留注释并移到表头之前。
+                indent = text[text.rfind('\n', 0, i) + 1:i]
+                edits.append((i, suffix_end, suffix.lstrip() + newline + indent + header))
+            elif text[i:end] != header:
+                edits.append((i, end, header))
+            i = line_end + 1
+        else:
+            end = delimiter(i, '=')
+            key = text[i:end].rstrip()
+            path = key_path(key)
+            normalized = '.'.join(toml_key(k) for k in path)
+            if key != normalized:
+                edits.append((i, i + len(key), normalized))
+            next_statement = value_end(end + 1)
+            full_path = section + path
+            editor_string = (full_path in (('model_provider',), ('model',))
+                             or (provider_id is not None
+                                 and full_path[:-1] == ('model_providers', provider_id)
+                                 and full_path[-1] in ('name', 'base_url', 'wire_api',
+                                                       'env_key', 'experimental_bearer_token')))
+            if editor_string and re.fullmatch(
+                r'''\s*(?:"(?:\\.|[^"\\\r\n])*"|'[^'\r\n]*')\s*(?:#[^\r\n]*)?\s*''',
+                text[end + 1:next_statement],
+            ) is None:
+                # CC Switch 无法编辑多行或三引号形式的关键字段。
+                expand_layout = True
+            i = next_statement
+    if provider_id is not None and ('model_providers', provider_id) not in sections:
+        # 点号赋值和内联供应商表合法，但缺少 CC Switch 可编辑的实体表头。
+        expand_layout = True
+    if expand_layout:
+        return dump_toml(original)
+    for start, end, replacement in reversed(edits):
+        text = text[:start] + replacement + text[end:]
+    result = (b'\xef\xbb\xbf' if raw.startswith(b'\xef\xbb\xbf') else b'') + text.encode('utf-8')
+    if not equivalent(original, parse_config(result)):
+        raise SetupError('TOML 格式规范化改变了配置含义；未修改配置。')
+    return result
+
+
 def plan(home: Path) -> dict[str, Any]:
     before = {f: read_optional(home / f) for f in ('config.toml', 'auth.json')}
     if before['config.toml'] is None:
@@ -433,15 +582,10 @@ def plan(home: Path) -> dict[str, Any]:
             raise SetupError('现有模型目录不是有效 JSON。') from None
         if not isinstance(obj,dict) or not isinstance(obj.get('models'),list):
             raise SetupError('现有模型目录结构不受支持。')
-    # Repair the valid but over-quoted format written by this tool previously,
-    # even if the desired values already exist. Ordinary no-ops stay byte-stable.
-    original_text = before['config.toml'].decode('utf-8-sig')
-    legacy_quoted_format = (
-        '# Native image_gen registration compatibility (experimental).' in original_text.splitlines()
-        and re.search(r'^\["model_providers"(?:\]|\.)', original_text, re.MULTILINE) is not None
-    )
-    config_bytes = (before['config.toml'] if equivalent(config, original_config) and not legacy_quoted_format
-                    else dump_toml(config))
+    # 兼容性取决于键的写法，与文件来源或旧标记是否保留无关；
+    # 即使功能字段已齐全，仍需规范化多余引号。
+    config_bytes = (normalize_toml_key_syntax(before['config.toml'], pid)
+                    if equivalent(config, original_config) else dump_toml(config))
     after = {'config.toml': config_bytes, 'auth.json': before['auth.json']}
     proposal = {'before':before, 'after':after, 'config':config, 'provider_id':pid,
             'model':model, 'catalog':catalog, 'summary':{
